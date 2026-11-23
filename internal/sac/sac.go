@@ -137,6 +137,19 @@ func IsContractAddress(s string) bool {
 	return err == nil
 }
 
+// ContractIDBytes returns the 32 raw bytes a contract strkey (C…) encodes.
+//
+// It is the inverse of the strkey rendering and nothing more: the bytes are
+// only ever used to build an invocation of that contract, never to decide
+// which asset it is — that answer comes from the contract itself and is
+// checked against Address before it is trusted.
+func ContractIDBytes(s string) ([]byte, error) {
+	if !IsContractAddress(s) {
+		return nil, fmt.Errorf("%w: %q is not a contract address", ErrInvalidAsset, s)
+	}
+	return decodeStrkey(strkeyVersionContract, s)
+}
+
 // crc16XModem is the checksum strkey appends (polynomial 0x1021, init 0).
 func crc16XModem(data []byte) uint16 {
 	var crc uint16
