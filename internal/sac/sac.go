@@ -44,6 +44,23 @@ var ErrInvalidAsset = errors.New("sac: invalid asset")
 
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
 
+// Passphrase maps standard network names ("testnet", "pubnet", "public", "futurenet", "standalone")
+// to their Stellar network passphrase. If network is not a recognized name, it is returned unchanged.
+func Passphrase(network string) string {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "testnet":
+		return "Test SDF Network ; September 2015"
+	case "pubnet", "public":
+		return "Public Global Stellar Network ; September 2015"
+	case "futurenet":
+		return "Test SDF Future Network ; October 2022"
+	case "standalone":
+		return "Standalone Network ; February 2017"
+	default:
+		return network
+	}
+}
+
 // Native returns the SAC address of the network's native asset (XLM).
 func Native(networkPassphrase string) string {
 	asset := make([]byte, 4)
@@ -137,17 +154,9 @@ func IsContractAddress(s string) bool {
 	return err == nil
 }
 
-// ContractIDBytes returns the 32 raw bytes a contract strkey (C…) encodes.
-//
-// It is the inverse of the strkey rendering and nothing more: the bytes are
-// only ever used to build an invocation of that contract, never to decide
-// which asset it is — that answer comes from the contract itself and is
-// checked against Address before it is trusted.
-func ContractIDBytes(s string) ([]byte, error) {
-	if !IsContractAddress(s) {
-		return nil, fmt.Errorf("%w: %q is not a contract address", ErrInvalidAsset, s)
-	}
-	return decodeStrkey(strkeyVersionContract, s)
+// CRC16 is CRC16-XMODEM, the checksum strkey appends (polynomial 0x1021, init 0).
+func CRC16(data []byte) uint16 {
+	return crc16XModem(data)
 }
 
 // crc16XModem is the checksum strkey appends (polynomial 0x1021, init 0).
