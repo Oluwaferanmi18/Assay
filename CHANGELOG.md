@@ -64,6 +64,11 @@ matching section — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
 
 ### safety-registry
 
+- **2026-11-23 — error variants declared in ascending order.** `NotAttested`
+  (5) and `NoPendingAdmin` (6) were declared out of order; they are now
+  reordered to ascending numeric order so the next variant is harder to
+  misnumber. No value changed, and the ABI pin test is untouched
+  ([#354](https://github.com/use-assay/Assay/issues/354)).
 - **2026-11-21 — `INTERFACE_VERSION` 3 → 4: `Quorum::InvalidArguments`.**
   `quorum` returned `Unavailable(0)` for `threshold == 0`, a threshold above
   the deduplicated set, or a set above `MAX_ATTESTORS`, so a miscalibrated
@@ -123,6 +128,17 @@ matching section — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
   [Deployments](#deployments-stellar-testnet) for the redeploy.
 
 ## CLI and HTTP API
+
+- **2026-11-23 — the SAC admin is reported as evidence; mutability reads
+  signers.** A scan now reads the asset's Stellar Asset Contract admin over
+  Soroban RPC (`ASSAY_SAC_ADMIN_RPC_URL`; testnet has a default, pubnet does
+  not) and the capability finding states it when it has moved off the issuer,
+  without changing severity or the hash of an asset whose admin did not move.
+  The mutability finding gains a fourth state, locked-by-signers: master key
+  weight 0, no other signer, and a non-zero medium threshold. It never sets
+  the `auth_immutable` bit and never moves severity
+  ([#356](https://github.com/use-assay/Assay/issues/356),
+  [#359](https://github.com/use-assay/Assay/issues/359)).
 
 - **2026-11-21 — bounded history pages, a global store bound, and typed
   de-escalation.** `/api/v1/history` takes `limit`/`before` and returns
