@@ -10,7 +10,8 @@ usage:
   assay scan CODE-ISSUER|C...     classify one asset and print the report as JSON
                                   (a C... SAC address is resolved via Stellar RPC)
   assay attestation CODE-ISSUER   print the on-chain attest() arguments for one asset
-  assay verify [-json] [-max-age SECS] [-differential [-rpc URL]] CODE-ISSUER
+  assay verify [-json] [-max-age SECS] [-differential [-rpc URL]]
+               [-registry-rpc URL] [-contract C...] [-network NETWORK] CODE-ISSUER
                                   compare a live scan with the on-chain attestation
                                   (with -differential, also re-read issuer flags via RPC)
   assay verify -bundle IN [-json]
@@ -19,13 +20,13 @@ usage:
                                   compare two saved reports and print what changed
   assay history [-guarantee] [-raw] [-server URL] CODE-ISSUER
                                   print the asset's observation history
-  assay registry-history [-rpc URL] [-contract C...] [-json] ASSET
+  assay registry-history [-registry-rpc URL] [-rpc URL] [-contract C...] [-network NETWORK] [-json] ASSET
                                   print the registry's attest/revoke events for an asset
                                   (CODE-ISSUER or SAC address), bounded by RPC event retention
   assay verify-preimage [-version VERSION] HASH PREIMAGE
                                   compare a stored hash with canonical preimage bytes
   assay checks                    print every check's ID and description
-  assay serve [-addr] [-history PATH] [-observe FILE] [-observe-interval DURATION]
+  assay serve [-addr] [-history PATH] [-history-retention N] [-observe FILE] [-observe-interval DURATION]
                                   serve the HTTP API and UI
   assay version                   print scanner identity, preimage encodings
                                   and build (VCS, Go) information
@@ -33,7 +34,10 @@ usage:
 Commands that scan also accept:
   -cache-directory-ttl D   reuse a curated directory answer for D (0 disables)
   -cache-blocklist-ttl D   reuse a blocklist answer for D (0 disables)
-  -no-cache                re-fetch curated sources on every scan
+  -no-cache                re-fetch curated sources and asset lists on every scan
+
+Commands that consume SEP-0042 asset lists (scan, attestation, history, serve)
+also accept:
   -asset-lists URL[,URL...]
                            SEP-0042 Stellar Asset Lists to consume
                            (repeatable). No list is used by default.
@@ -61,7 +65,13 @@ The history command additionally accepts:
   -server URL             fetch history from a running assay server instead of
                           computing from a local scan (e.g. http://localhost:8080)
 
+The verify command additionally accepts:
+  -registry-rpc URL       Soroban RPC endpoint for the registry (env ASSAY_RPC_URL)
+  -contract ID            registry contract id (env ASSAY_CONTRACT_ID)
+  -network NAME           network used to derive the SAC id (env ASSAY_NETWORK)
+
 The serve command additionally accepts:
+  -history-retention N    observations kept per asset (default 256)
   -observe FILE           path to asset list file for scheduled observation
   -observe-interval DURATION
                           interval between scheduled scans (default 6h)
@@ -69,7 +79,8 @@ The serve command additionally accepts:
                           trusted reverse proxy CIDRs for rate limiting
 ```
 
-Commands that scan also accept:
+Commands that consume SEP-0042 asset lists (`scan`, `attestation`, `history`,
+`serve`) also accept:
 
 - `-asset-lists URL[,URL...]` — SEP-0042 Stellar Asset Lists to consume, given
   as a comma-separated list or repeated. **No list is used by default**: nothing
@@ -99,6 +110,20 @@ the input is accepted only when re-deriving that asset's SAC address reproduces
 it, so a contract that names some other asset is refused rather than believed.
 The RPC endpoint is `ASSAY_RPC_URL` or the public endpoint for the scanned
 network (SDF testnet, or `https://mainnet.sorobanrpc.com` on pubnet).
+
+### The Horizon endpoint (`-horizon`)
+
+`scan`, `attestation` and `serve` take `-horizon URL` to choose the Horizon
+server they read from. The flag overrides the `ASSAY_HORIZON_URL` environment
+variable, which in turn overrides the public default
+(`https://horizon.stellar.org`). Evidence URLs in the report name the endpoint
+that actually answered, so a report produced against a private Horizon says so.
+
+```
+./assay scan -horizon https://horizon.example.org CODE-ISSUER
+./assay attestation -horizon https://horizon.example.org CODE-ISSUER
+./assay serve -addr :8080 -horizon https://horizon.example.org
+```
 
 ## assay scan
 
@@ -208,6 +233,13 @@ Flags:
 - `-contract ID` — registry contract ID (default: live deployment, env `ASSAY_CONTRACT_ID`).
 - `-network NAME` — network used to derive the SAC ID (default: `testnet`, env `ASSAY_NETWORK`).
 
+Every command that scans also reads the asset's Stellar Asset Contract admin when
+an RPC endpoint is available: env `ASSAY_SAC_ADMIN_RPC_URL`. A testnet scan
+defaults to the SDF testnet endpoint; a pubnet scan skips the read unless the
+variable is set, because there is no pubnet RPC endpoint this project treats as
+authoritative. The admin is evidence only and never changes severity; see
+[the severity model](severity-model.md#the-sac-admin-is-evidence-not-a-severity-input).
+
 The contract and network default to `ASSAY_CONTRACT_ID` and `ASSAY_NETWORK` (or the
 compiled defaults: live testnet registry and testnet). The verdict classes are deliberately
 distinct, and each has its own exit code:
@@ -288,8 +320,10 @@ whether it was ever different.
 
 Each entry carries the asset, the report's severity at scan time, the
 **transition** — what the issuer was observed doing, reduced to a term
-(`malicious`, `listed as`, `blocked`, `unverified`, `not retrievable`, …) — the
-observation's reason verbatim, and the time it was retrieved.
+(`malicious`, `listed as`, `blocked`, or `not retrievable`) — the observation's
+reason verbatim, and the time it was retrieved. These labels come from the
+check, evidence source, fetch status, and structured outcome. Claim text is
+shown as the reason only; it does not determine the label.
 
 An observation that does not reduce to a known transition prints as
 `unknown`. The history view deliberately does not re-derive the verdict; it
@@ -311,7 +345,7 @@ Semantics:
 - **valid state** — the observations print in time order.
 - **missing state** — a clear message (`no observations for ASSET`), and exit
   0 unless `-guarantee` was given.
-- **unknown state** — an observation whose claim matches no known transition
+- **unknown state** — an observation without a recognized structured outcome
   prints with transition `unknown` rather than being dropped.
 
 ## assay verify-preimage
@@ -366,6 +400,7 @@ see `docs/integrating.md` for what a consumer reads out of it, and
 ```
 ./assay serve -addr :8080
 ./assay serve -addr :8080 -history /var/lib/assay/history.jsonl
+./assay serve -addr :8080 -history /var/lib/assay/history.jsonl -history-retention 1024
 ./assay serve -addr :8080 -scan-rate 10 -scan-burst 20
 ```
 
@@ -373,7 +408,9 @@ Each successful `GET /api/v1/scan` records an observation, and
 `GET /api/v1/history?asset=CODE-ISSUER` returns them in time order with the
 derived transitions. `-history` points that store at an append-only JSON Lines
 log so it survives a restart; without it, history is in memory and lost when the
-process exits. The default retention is 256 observations per asset and the
+process exits. `-history-retention N` sets how many observations are kept per
+asset, for both the in-memory and the file-backed store; the default is 256 and
+`GET /api/v1/history` reports the configured value as `retention`. The full
 policy is in [history.md](history.md).
 
 **Rate limiting.** `GET /api/v1/exposure` is always rate-limited (default: 5

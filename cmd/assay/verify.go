@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -61,14 +60,12 @@ const (
 )
 
 // OnChainSafety mirrors the registry's get_safety return: the stored
-// attestation for one asset, now including the preimage version so a
-// verifier does not have to guess which encoding produced the hash.
+// attestation for one asset.
 type OnChainSafety struct {
-	Severity        uint32 `json:"severity"`
-	Flags           uint32 `json:"flags"`
-	EvidenceHash    string `json:"evidence_hash"`
-	AttestedAt      int64  `json:"attested_at"`
-	PreimageVersion uint32 `json:"preimage_version"`
+	Severity     uint32 `json:"severity"`
+	Flags        uint32 `json:"flags"`
+	EvidenceHash string `json:"evidence_hash"`
+	AttestedAt   int64  `json:"attested_at"`
 }
 
 // registryReader reads the on-chain attestation for one asset. It is an
@@ -352,8 +349,8 @@ func writeVerifyResult(w io.Writer, res *VerifyResult, asJSON bool) error {
 				res.Local.Severity, res.Local.Flags, res.Local.EvidenceHash)
 		}
 		if res.Chain != nil {
-			_, _ = fmt.Fprintf(w, "chain: severity=%d flags=%d evidence_hash=%s attested_at=%d preimage_version=%d\n",
-				res.Chain.Severity, res.Chain.Flags, res.Chain.EvidenceHash, res.Chain.AttestedAt, res.Chain.PreimageVersion)
+			_, _ = fmt.Fprintf(w, "chain: severity=%d flags=%d evidence_hash=%s attested_at=%d\n",
+				res.Chain.Severity, res.Chain.Flags, res.Chain.EvidenceHash, res.Chain.AttestedAt)
 		}
 	}
 	if res.Differential != nil {
@@ -424,7 +421,8 @@ func verifyBundle(path string, asJSON bool, w io.Writer) (int, error) {
 }
 
 func runVerify(args []string) error {
-	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	fs := newFlagSet("verify")
+	cache := cacheFlags(fs)
 	maxAge := fs.Int64("max-age", 0, "treat an attestation older than this many seconds as stale (0 disables the age check)")
 	asJSON := fs.Bool("json", false, "print the verdict as JSON for scripting")
 	bundlePath := fs.String("bundle", "",
@@ -481,7 +479,7 @@ func runVerify(args []string) error {
 	if *differentialEnabled {
 		differentialRPC = *rpcURL
 	}
-	scanner := scan.New()
+	scanner := scan.NewWithOptions(cache())
 	reader := newRegistryReader(*registryRPC, *contractID, *network)
 	res, verdict := verifyAsset(ctx, asset, *maxAge, time.Now(),
 		scanner.ScanWithSubject,

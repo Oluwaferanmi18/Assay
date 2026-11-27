@@ -22,6 +22,8 @@ import (
 	"github.com/use-assay/assay/internal/clockskew"
 	"github.com/use-assay/assay/internal/horizon"
 	"github.com/use-assay/assay/internal/mechanics"
+	"github.com/use-assay/assay/internal/sac"
+	"github.com/use-assay/assay/internal/sacadmin"
 	"github.com/use-assay/assay/internal/sep1"
 	"github.com/use-assay/assay/internal/stellarexpert"
 )
@@ -53,18 +55,6 @@ var ErrBadAsset = errors.New("scan: invalid asset")
 // It is returned before any fetch, so it can never produce a report.
 // Documented in docs/cli.md (exit code) and docs/api.md (HTTP status).
 var ErrNativeAsset = errors.New("native asset has no issuer and no authorization flags")
-
-// ErrBadHolder reports an invalid holder account ID.
-var ErrBadHolder = errors.New("scan: invalid holder account ID")
-
-// ValidateHolder checks that id is a valid Stellar ed25519 public key suitable
-// for use as a holder account ID.
-func ValidateHolder(id string) error {
-	if !issuerRE.MatchString(id) {
-		return fmt.Errorf("%w: %q", ErrBadHolder, id)
-	}
-	return nil
-}
 
 // ParseAsset accepts the canonical CODE-ISSUER form, the colon-separated
 // CODE:ISSUER form most Stellar tools print, and a paste-able stellar.expert
@@ -236,6 +226,18 @@ type Scanner struct {
 	// mistake, it is a false attestation.
 	Network horizon.Network
 
+	// SACAdminRPC is the Soroban RPC endpoint used to read each asset's Stellar
+	// Asset Contract admin (#356). NewWithOptions seeds it from
+	// ASSAY_SAC_ADMIN_RPC_URL; the default rule is described below.
+	//
+	// When empty, the SDF testnet endpoint is used for a testnet scan and the
+	// lookup is skipped on pubnet: this repository does not publish a pubnet RPC
+	// endpoint it is willing to treat as authoritative, and the admin read is
+	// evidence only, so a skipped lookup is recorded rather than guessed. The
+	// skipped state is distinct from a failed fetch and from "the admin is the
+	// issuer".
+	SACAdminRPC string
+
 	// AssetListURLs are the curated lists consulted for every scan, in order.
 	//
 	// It is empty by default, deliberately: no list is shipped as
@@ -267,6 +269,14 @@ type Options struct {
 	// re-fetches both curated sources. Use it when a stale answer would be
 	// unacceptable and the extra requests are affordable.
 	NoReputationCache bool
+
+	// AssetListTTL bounds how long a configured SEP-0042 list may be served
+	// from cache, measured from the fetch that produced it. A zero TTL disables
+	// list caching. Lists are large, change rarely and are re-fetched on every
+	// scan that configures them, so they are cached like the curated
+	// reputation answers; a hit keeps the list's original fetch time, which is
+	// what the report carries. See docs/caching.md.
+	AssetListTTL time.Duration
 }
 
 // DefaultOptions returns the production cache policy.
@@ -274,6 +284,7 @@ func DefaultOptions() Options {
 	return Options{
 		ReputationDirectoryTTL: stellarexpert.DefaultDirectoryTTL,
 		ReputationBlocklistTTL: stellarexpert.DefaultBlocklistTTL,
+		AssetListTTL:           assetlist.DefaultTTL,
 	}
 }
 
@@ -300,7 +311,9 @@ func New() *Scanner {
 // pointing one at http://127.0.0.1:1 makes that source fail and the scan
 // report undetermined (or fail, for Horizon) rather than succeed.
 //
-// Only the reputation lookups are cached. Horizon is left uncached on purpose:
+// The reputation lookups and configured SEP-0042 lists are cached; each cached
+// answer keeps its original fetch time, and expiry always means a re-fetch.
+// Horizon is left uncached on purpose:
 // issuer authorization flags are the capability axis severity is derived from,
 // they can change in one ledger close (~5 s), and there is no retrieved-at
 // field in an attestation that could carry the age of a stale flag read. A TTL
@@ -309,13 +322,14 @@ func New() *Scanner {
 // docs/caching.md.
 func NewWithOptions(opts Options) *Scanner {
 	return &Scanner{
-		Horizon: horizon.New(os.Getenv("ASSAY_HORIZON_URL")),
-		Toml:    sep1.NewFetcher(),
-		Expert:  stellarexpert.NewWithOptions(os.Getenv("ASSAY_STELLAREXPERT_URL"), expertOptions(opts)),
-		Engine:  mechanics.NewEngine(),
-		Lists:   assetlist.New(),
-		RPC:     &http.Client{Timeout: 15 * time.Second},
-		Network: horizon.PublicNet,
+		Horizon:     horizon.New(os.Getenv("ASSAY_HORIZON_URL")),
+		Toml:        sep1.NewFetcher(),
+		Expert:      stellarexpert.NewWithOptions(os.Getenv("ASSAY_STELLAREXPERT_URL"), expertOptions(opts)),
+		Engine:      mechanics.NewEngine(),
+		Lists:       assetlist.NewWithOptions(assetlist.Options{TTL: opts.AssetListTTL}),
+		RPC:         &http.Client{Timeout: 15 * time.Second},
+		Network:     horizon.PublicNet,
+		SACAdminRPC: os.Getenv("ASSAY_SAC_ADMIN_RPC_URL"),
 	}
 }
 
@@ -329,6 +343,16 @@ func expertOptions(opts Options) stellarexpert.Options {
 		o.BlocklistTTL = 0
 	}
 	return o
+}
+
+// sep42Network converts a Stellar network passphrase to the short name used in
+// SEP-0042 asset list JSON ("public" or "testnet"). Any unknown passphrase maps
+// to "public" as the safer default.
+func sep42Network(n horizon.Network) string {
+	if n == horizon.TestNet {
+		return "testnet"
+	}
+	return "public"
 }
 
 // resolveNetwork decides which network a scan is on.
@@ -352,6 +376,19 @@ func (s *Scanner) resolveNetwork() (horizon.Network, error) {
 		return "", fmt.Errorf("scan: %w; set Scanner.Network to the passphrase of the ledger Horizon at %s serves",
 			deriveErr, s.Horizon.BaseURL)
 	}
+}
+
+// sacAdminRPC returns the Soroban RPC endpoint to read the SAC admin from, or
+// "" when none is configured for this network. See Scanner.SACAdminRPC for why
+// pubnet has no default.
+func (s *Scanner) sacAdminRPC(network horizon.Network) string {
+	if s.SACAdminRPC != "" {
+		return s.SACAdminRPC
+	}
+	if network == horizon.TestNet {
+		return sacadmin.DefaultTestnetURL
+	}
+	return ""
 }
 
 func (s *Scanner) fetchTimeout() time.Duration {
@@ -385,7 +422,12 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 	if err != nil {
 		return nil, err
 	}
-	sub := &mechanics.Subject{Asset: a, ScannedAt: s.now(), Network: network}
+	sub := &mechanics.Subject{
+		Asset:      a,
+		ScannedAt:  s.now(),
+		Network:    network,
+		HorizonURL: s.Horizon.BaseURL,
+	}
 	timeout := s.fetchTimeout()
 
 	statCtx, cancelStat := context.WithTimeout(ctx, timeout)
@@ -408,16 +450,38 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 	issuer, err := s.Horizon.Account(acctCtx, a.Issuer)
 	cancelAcct()
 	if err != nil {
-		return nil, fmt.Errorf("scan: fetch issuer account: %w", err)
-	}
-	sub.Issuer = issuer
-	sub.IssuerFetchedAt = s.now()
-	if issuer != nil {
-		sub.IssuerLedger = issuer.LatestLedger
+		if errors.Is(err, horizon.ErrNotFound) {
+			// The issuer account has been merged: the /accounts endpoint returned
+			// 404. The asset record may still exist. Mark the subject so the
+			// capability check can report undetermined rather than treating the
+			// absence as a clean single-source read.
+			sub.IssuerMerged = true
+		} else {
+			return nil, fmt.Errorf("scan: fetch issuer account: %w", err)
+		}
+	} else {
+		sub.Issuer = issuer
+		sub.IssuerFetchedAt = s.now()
+		if issuer != nil {
+			sub.IssuerLedger = issuer.LatestLedger
+		}
 	}
 
 	var (
 		wg sync.WaitGroup
+
+		// The SAC admin (#356) is fetched alongside the reputation lookups. It is
+		// evidence only, so every failure — no endpoint configured, an RPC error,
+		// an unreadable entry — is recorded on the subject and never fails the
+		// scan. "Skipped" and "failed" stay distinct from "the admin is the
+		// issuer".
+		sacAdmin            string
+		sacAdminErr         string
+		sacAdminSkipped     string
+		sacAdminURL         string
+		sacAdminAttemptedAt time.Time
+		sacAdminFetchedAt   time.Time
+		sacAdminLedger      int64
 
 		// StellarExpert's asset metadata is fetched best-effort alongside the
 		// other post-account lookups. A network drop is recorded on the subject
@@ -450,6 +514,33 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 		dirAttAt     time.Time
 		dirURL       string
 	)
+
+	sacAddr, sacAddrErr := sac.Address(a.Code, a.Issuer, string(network))
+	switch {
+	case sacAddrErr != nil:
+		sacAdminErr = "derive SAC address: " + sacAddrErr.Error()
+	case s.sacAdminRPC(network) == "":
+		sacAdminSkipped = "no Soroban RPC endpoint is configured for " + string(network) +
+			"; the SAC admin was not read (set ASSAY_SAC_ADMIN_RPC_URL)"
+	default:
+		sacAdminURL = s.sacAdminRPC(network)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sacCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			sacAdminAttemptedAt = s.now()
+			admin, err := sacadmin.New(sacAdminURL).Admin(sacCtx, sacAddr)
+			if err != nil {
+				// This is not an SEP-1-style HTTP status, so the raw error is
+				// recorded rather than flattened through CanonicalFailure.
+				sacAdminErr = err.Error()
+				return
+			}
+			sacAdmin = admin
+			sacAdminFetchedAt = s.now()
+		}()
+	}
 
 	// Canonicalise the issuer's free-text home_domain once, here, so that
 	// every consumer of the string agrees on which domain is being named:
@@ -529,7 +620,7 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 	// unlike the domain-keyed lookups above, which need a home_domain. It runs
 	// with the rest of the concurrent group so that a slow or dead
 	// StellarExpert cannot serialise another fetch's timeout onto the scan.
-	expertAssetURL = s.Expert.AssetURL(a.Code, a.Issuer)
+	expertAssetURL = s.Expert.AssetURLForNetwork(a.Code, a.Issuer, string(network))
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -548,6 +639,15 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 	}()
 
 	wg.Wait()
+
+	sub.SACAddress = sacAddr
+	sub.SACAdmin = sacAdmin
+	sub.SACAdminErr = sacAdminErr
+	sub.SACAdminSkipped = sacAdminSkipped
+	sub.SACAdminURL = sacAdminURL
+	sub.SACAdminAttemptedAt = sacAdminAttemptedAt
+	sub.SACAdminFetchedAt = sacAdminFetchedAt
+	sub.SACAdminLedger = sacAdminLedger
 
 	sub.ExpertAssetURL = expertAssetURL
 	sub.ExpertAsset = expertAssetVal
@@ -623,6 +723,14 @@ func (s *Scanner) Subject(ctx context.Context, a mechanics.Asset) (*mechanics.Su
 				FetchedAt:   list.FetchedAt,
 				AttemptedAt: attempted,
 			}
+			// A list whose declared network differs from the scan's is evidence
+			// about a different ledger: a pubnet listing must not count as
+			// evidence about a testnet asset and vice versa (#593).
+			if list.Network != "" && list.Network != sep42Network(network) {
+				sig.Err = "list network " + list.Network + " does not match scan network " + sep42Network(network) + "; not applicable"
+				sub.AssetLists = append(sub.AssetLists, sig)
+				continue
+			}
 			// Match on the classic pair, and on the asset's contract address as
 			// a second key: a list may publish either, and Horizon reports the
 			// SAC on the asset record we already hold.
@@ -695,10 +803,26 @@ func (s *Scanner) SubjectWithHolder(ctx context.Context, a mechanics.Asset, hold
 	if holder == "" {
 		return sub, nil
 	}
-	sub.Holder = holder
+	// An M… holder is a virtual account: it has no ledger entry, so the
+	// trustline lookup has to be made against the base G… account. The
+	// original address and its multiplexing id are kept on the Subject so the
+	// report can say the resolution happened rather than presenting a trustline
+	// for one address under another address's name (issue #410). Callers that
+	// reach here through the API or CLI have already had the identifier
+	// validated; the error path exists so a programmatic caller gets the same
+	// refusal instead of a lookup against a malformed address.
+	base, muxedID, muxed, err := ParseHolder(holder)
+	if err != nil {
+		return nil, err
+	}
+	sub.Holder = base
+	if muxed {
+		sub.HolderMuxed = holder
+		sub.HolderMuxedID = muxedID
+	}
 	tlCtx, cancel := context.WithTimeout(ctx, s.fetchTimeout())
 	defer cancel()
-	tl, err := s.Horizon.Trustline(tlCtx, holder, a.Code, a.Issuer)
+	tl, err := s.Horizon.Trustline(tlCtx, base, a.Code, a.Issuer)
 	if errors.Is(err, horizon.ErrNotFound) {
 		// Holder does not hold the asset; HolderTrustline stays nil with no
 		// error. The source did answer — "not listed" — so this records a

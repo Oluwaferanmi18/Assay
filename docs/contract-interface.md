@@ -102,10 +102,23 @@ a wasm hash.
   safely ignore (a new `get_safety_many` does not break an existing
   `get_safety` caller), and documentation-only changes.
 
+### Version history
+
 Adding `version()` itself establishes version 1: the interface as of that
-build is version 1. Version 2 adds `cancel_admin_transfer` and the
-`cancel_admin` event. The constant is an ABI value and is parsed by the Go ABI
-drift test, so it cannot drift from the deployed interface without a red build.
+build is version 1. Every later bump is recorded here, one row per version.
+This table is the changelog the contract's rustdoc points at, and the
+`interface_version_history_is_documented` test fails if `INTERFACE_VERSION`
+names a version with no row.
+
+| Version | Change |
+| --- | --- |
+| 1 | `version()` established the interface. |
+| 2 | Adds `cancel_admin_transfer` and the `cancel_admin` event, and `Error::InvalidAsset` for an address that cannot name a SAC. |
+| 3 | Adds `preimage_version: u32` to the stored `Safety`, written by `attest` and `attest_many`, so a verifier can tell which encoding produced `evidence_hash`. |
+| 4 | Adds `Quorum::InvalidArguments`, so a malformed `quorum` call is no longer reported as `Quorum::Unavailable`. |
+
+The constant is an ABI value and is parsed by the Go ABI drift test, so it
+cannot drift from the deployed interface without a red build.
 
 | Error | Code | Returned by |
 | --- | --- | --- |
@@ -589,6 +602,17 @@ have very different tolerances. `max_age_secs = 0` opts out explicitly.
 (see [timestamps.md](timestamps.md)); recommended bands with reasoning, the
 re-attestation cadence, and consumer guidance are in [freshness.md](freshness.md).
 
+The policy helper [`assay_gate::check_policy`](integrating.md#2-decide-what-you-are-refusing)
+deliberately gives zero a stricter meaning: `max_age_secs = 0` there allows
+only an attestation whose computed age is zero. Normally that means an
+attestation from the current ledger second; a future timestamp also has age
+zero because the helper uses `saturating_sub`. Keep this split. The registry's
+zero-age opt-out is already part of the deployed interface, and changing it to
+reject zero would change on-chain behavior and require an interface-version
+bump. The helper remains fail-closed for integrators who pass a zero-initialized
+or otherwise missing freshness setting. Do not reuse zero between the
+registry and `check_policy` expecting the same policy.
+
 [freshness.md](freshness.md) is the guidance for picking a value: what changes
 under an attestation, how fast (measured, not guessed), and defensible windows
 per use class.
@@ -934,6 +958,21 @@ pubnet facts under a testnet contract.
 An undeterminable network is an error, never a default, for the same reason an
 unread flag is `Unevaluated` rather than `Clear`: a guessed network name in a
 hashed field is a false attestation waiting to be written.
+
+#### Network-accurate evidence URLs and preimage versioning
+
+Horizon evidence lines cite the base URL of the Horizon instance that answered
+the scan (`Subject.HorizonURL`, falling back to `horizon.DefaultTestnetURL` on
+testnet and `horizon.DefaultURL` on pubnet). Citing testnet Horizon on testnet
+scans does not require a preimage version bump:
+- The preimage grammar (`evidence\tsource\turl\tclaim`) is unchanged.
+- Pubnet output is byte-for-byte identical: pubnet scans continue to cite
+  `https://horizon.stellar.org`, leaving existing pubnet preimage hashes and
+  golden vectors unchanged.
+- On testnet, generating the testnet Horizon URL corrects an evidence defect
+  where URLs pointed to pubnet ledgers. Because the preimage grammar already
+  accepts arbitrary valid URLs in the `url` field, verifiers require no schema
+  changes.
 
 ### Formal grammar (ABNF)
 
